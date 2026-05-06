@@ -3,18 +3,16 @@ import asyncio
 import aiohttp
 import json
 import logging
-from datetime import datetime
-from typing import Optional, List, Dict, Any
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from dotenv import load_dotenv
-
-# Библиотека Supabase (нужно добавить в requirements.txt)
 from supabase import create_client, Client
 
 # ═══ НАСТРОЙКА ЛОГИРОВАНИЯ ═══
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 load_dotenv()
@@ -25,319 +23,311 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# Валидация ключей
 if not all([TELEGRAM_TOKEN, GROQ_API_KEY, SUPABASE_URL, SUPABASE_KEY]):
-    raise ValueError("❌ ОШИБКА: Проверьте переменные окружения (TELEGRAM, GROQ, SUPABASE)")
+    raise ValueError("❌ Проверьте переменные окружения!")
 
-# Очистка ключей
-TELEGRAM_TOKEN = TELEGRAM_TOKEN.strip()
-GROQ_API_KEY = GROQ_API_KEY.strip()
-SUPABASE_URL = SUPABASE_URL.strip()
-SUPABASE_KEY = SUPABASE_KEY.strip()
-
-# Инициализация Supabase
-try:
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-    logger.info("✅ Подключение к Supabase успешно")
-except Exception as e:
-    logger.error(f"❌ Ошибка подключения к Supabase: {e}")
-    raise e
+# Инициализация
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+logger.info("✅ Supabase connected")
 
 # Настройки AI
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
-TEXT_MODEL = "llama-3.1-8b-instant"
+MODEL_FAST = "llama-3.1-8b-instant" # Для роутинга и быстрых задач
+MODEL_PRO = "llama-3.1-70b-versatile" # Для сложной аналитики и коучинга (если доступен, иначе 8b)
 WHISPER_MODEL = "whisper-large-v3-turbo"
 
-# ═══ БАЗА ДАННЫХ (SUPABASE WRAPPER) ═══
-
-class Database:
+# ═══ БАЗА ДАННЫХ (SUPABASE) ═══
+class CloudDB:
     @staticmethod
     def ensure_user(tg_id: int, username: str):
-        """Создает пользователя, если нет"""
         try:
-            supabase.table("users").insert({
-                "telegram_id": tg_id,
-                "username": username
-            }).eq("telegram_id", tg_id).execute() # Upsert logic simplified for demo
-            # Простая проверка: если есть - ок, если нет - создаем (игнорируем ошибки дублей)
-            data, count = supabase.table("users").select("*").eq("telegram_id", tg_id).execute()
-            if not data:
-                 supabase.table("users").insert({"telegram_id": tg_id, "username": username}).execute()
-        except Exception as e:
-            if "Duplicate" not in str(e): logger.warning(f"DB User Error: {e}")
+            supabase.table("users").insert({"telegram_id": tg_id, "username": username}).execute()
+        except: pass # Ignore duplicates
 
     @staticmethod
-    def add_task(tg_id: int, content: str):
-        """Добавляет задачу"""
+    def add_task(tg_id: int, content: str, deadline: Optional[str] = None):
         supabase.table("tasks").insert({
-            "telegram_id": tg_id,
-            "content": content,
-            "is_completed": False
+            "telegram_id": tg_id, "content": content, 
+            "deadline": deadline, "is_completed": False
         }).execute()
-        logger.info(f"Task saved to Cloud: {content}")
 
     @staticmethod
     def get_tasks(tg_id: int) -> List[Dict]:
-        """Получает активные задачи"""
-        response = supabase.table("tasks").select("*").eq("telegram_id", tg_id).eq("is_completed", False).order("created_at", desc=True).limit(10).execute()
-        return response.data or []
+        res = supabase.table("tasks").select("*").eq("telegram_id", tg_id).eq("is_completed", False).execute()
+        return res.data or []
 
     @staticmethod
-    def clear_tasks(tg_id: int):
-        """Помечает все задачи как выполненные (мягкое удаление)"""
-        supabase.table("tasks").update({"is_completed": True}).eq("telegram_id", tg_id).eq("is_completed", False).execute()
+    def get_history(tg_id: int, limit: int = 10) -> List[Dict]:
+        res = supabase.table("chat_history").select("*").eq("telegram_id", tg_id).order("created_at", desc=True).limit(limit).execute()
+        return list(reversed(res.data)) if res.data else []
 
     @staticmethod
-    def add_history(tg_id: int, role: str, message: str):
-        """Сохраняет историю переписки"""
-        try:
-            supabase.table("chat_history").insert({
-                "telegram_id": tg_id,
-                "role": role,
-                "message": message
-            }).execute()
-        except Exception as e:
-            logger.error(f"History save error: {e}")
-
-    @staticmethod
-    def get_recent_history(tg_id: int, limit: int = 5) -> List[Dict]:
-        """Получает последние N сообщений для контекста"""
-        response = supabase.table("chat_history").select("*").eq("telegram_id", tg_id).order("created_at", desc=True).limit(limit).execute()
-        # Возвращаем в прямом порядке
-        return list(reversed(response.data)) if response.data else []
+    def save_history(tg_id: int, role: str, msg: str):
+        supabase.table("chat_history").insert({"telegram_id": tg_id, "role": role, "message": msg}).execute()
 
     @staticmethod
     def get_knowledge(tg_id: int) -> str:
-        """Получает знания о пользователе"""
-        try:
-            response = supabase.table("ai_knowledge").select("key_name, value").eq("telegram_id", tg_id).execute()
-            if not response.data:
-                return "Нет специальных инструкций."
-            return "\n".join([f"- {item['key_name']}: {item['value']}" for item in response.data])
-        except Exception as e:
-            logger.error(f"Error getting knowledge: {e}")
-            return "Ошибка загрузки знаний."
+        res = supabase.table("ai_knowledge").select("category, key_name, value").eq("telegram_id", tg_id).execute()
+        if not res.data: return "Нет сохраненных предпочтений."
+        return "\n".join([f"- [{i['category']}] {i['key_name']}: {i['value']}" for i in res.data])
 
-db = Database()
+    @staticmethod
+    def save_knowledge(tg_id: int, category: str, key: str, value: str):
+        # Простая логика: обновляем или добавляем (в продакшене нужен upsert)
+        supabase.table("ai_knowledge").insert({
+            "telegram_id": tg_id, "category": category, "key_name": key, "value": value
+        }).execute()
 
-# ═══ ПРОМПТЫ АГЕНТОВ ═══
+db = CloudDB()
 
-ROUTER_PROMPT = """
-Ты — Диспетчер. Определи тип запроса:
-1. Код/Баги/Скрипты → "CODE"
-2. Планы/Текст/Идеи/Вопросы → "ASSISTANT"
-Верни ТОЛЬКО JSON: {"type": "CODE"|"ASSISTANT", "summary": "суть", "is_task": true/false}
-(is_task=true, если нужно запомнить факт или задачу).
+# ═══ СИСТЕМНЫЕ ПРОМПТЫ АГЕНТОВ ═══
+
+PROMPT_ORCHESTRATOR = """
+Ты — Orchestrator. Твоя задача: классифицировать запрос и выбрать АГЕНТА.
+Доступные агенты:
+1. BUSINESS_COACH: Продажи, стратегия, доход, жесткая обратная связь, борьба с прокрастинацией.
+2. PERSONAL_ASSISTANT: Планирование, задачи, дедлайны, рутина, черновики писем.
+3. SEARCH_AGENT: Поиск актуальных данных, трендов, фактов (имитация через общие знания).
+4. ANALYTICS_AGENT: Анализ метрик, переписки, паттернов поведения, отчеты.
+5. LEARNING_AGENT: Запоминание предпочтений, адаптация стиля, анализ обратной связи.
+6. CODER: Написание кода, отладка, технические задачи.
+
+Верни ТОЛЬКО JSON:
+{
+  "agent": "NAME", 
+  "reason": "почему выбран этот агент",
+  "needs_research": true/false,
+  "has_deadline": true/false,
+  "deadline_time": "YYYY-MM-DD HH:MM" или null
+}
 """
 
-CODER_PROMPT = """
-Ты Senior Developer. Пиши чистый код. Без воды. С комментариями.
+# Общие правила стиля для всех агентов
+STYLE_GUIDE = """
+[СТИЛЬ ОТВЕТА]
+- Без воды, мотивационных соплей и клише ("ты можешь!", "важно отметить").
+- Конкретика: цифры, факты, примеры, скрипты.
+- Структура: Используй эмодзи-навигацию (🎯📋✅❓💡).
+- Язык: Русский, деловой, краткий.
+- Финал: Всегда заканчивай конкретным шагом (✅) или вопросом (❓).
+- Если не знаешь — говори прямо.
 """
 
-ASSISTANT_PROMPT = """
-Ты Личный Ассистент. Отвечай структурно. Используй знания о пользователе, если они есть.
-Если пользователь просил запомнить что-то, подтверди: "✅ Сохранено в облако".
-"""
+AGENTS_PROMPTS = {
+    "BUSINESS_COACH": f"""
+    {STYLE_GUIDE}
+    РОЛЬ: Бизнес-тренер по продажам. Жесткий, проактивный, ориентированный на метрики.
+    ЗАДАЧИ: Анализ воронки, скрипты, стратегии дохода, работа с возражениями.
+    ФОРМАТ:
+    🎯 [Вывод]
+    📋 [План/Аргументы]
+    💡 [Инструмент/Скрипт]
+    ✅ [Шаг сейчас]
+    ❓ [Вопрос]
+    """,
+    
+    "PERSONAL_ASSISTANT": f"""
+    {STYLE_GUIDE}
+    РОЛЬ: Персональный ассистент. Проактивный, организованный.
+    ЗАДАЧИ: Управление задачами, календарем, черновики, напоминания.
+    ОСОБОЕ: Если видишь задачу с датой — предлагай напомнить.
+    ФОРМАТ:
+    [Суть]
+    📋 [Детали]
+    ✅ [Что сделано/Напоминание]
+    ❓ [Уточнение]
+    """,
 
-# ═══ AI ИНТЕГРАЦИЯ ═══
+    "SEARCH_AGENT": f"""
+    {STYLE_GUIDE}
+    РОЛЬ: Search Agent. Поиск и проверка информации.
+    ЗАДАЧИ: Факты, тренды, цены, конкуренты.
+    ФОРМАТ:
+    🔍 [Запрос]
+    🎯 [Ответ суть]
+    📋 [Детали с источниками]
+    ⚠️ [Примечание о достоверности]
+    """,
 
-async def call_groq_text(messages: List[Dict], system_prompt: str, response_format: Optional[str] = None) -> Optional[str]:
+    "ANALYTICS_AGENT": f"""
+    {STYLE_GUIDE}
+    РОЛЬ: Analytics Agent. Анализ данных и коммуникаций.
+    ЗАДАЧИ: Инсайты из переписки, метрики, паттерны.
+    ФОРМАТ:
+    📊 [Отчет]
+    🎯 [Главный инсайт]
+    💡 [Топ-3 инсайта]
+    🚀 [Рекомендация]
+    """,
+
+    "LEARNING_AGENT": f"""
+    {STYLE_GUIDE}
+    РОЛЬ: Learning Agent. Адаптация и запоминание.
+    ЗАДАЧИ: Запоминать предпочтения, анализировать успешные действия.
+    ДЕЙСТВИЕ: Если видишь новое предпочтение или паттерн — помечай его для сохранения в БД.
+    """,
+
+    "CODER": f"""
+    {STYLE_GUIDE}
+    РОЛЬ: Senior Developer.
+    ЗАДАЧИ: Чистый код, без воды, с комментариями.
+    ФОРМАТ:
+    💻 [Код в блоке]
+    ✅ [Как запустить/проверить]
+    """
+}
+
+# ═══ AI ФУНКЦИИ ═══
+
+async def call_groq(messages: List[Dict], model: str = MODEL_FAST, json_mode: bool = False) -> Optional[str]:
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    
-    full_messages = [{"role": "system", "content": system_prompt}] + messages
-    
     payload = {
-        "model": TEXT_MODEL,
-        "messages": full_messages,
+        "model": model,
+        "messages": messages,
         "temperature": 0.2,
         "max_tokens": 1500
     }
-    if response_format == "json":
+    if json_mode:
         payload["response_format"] = {"type": "json_object"}
 
     async with aiohttp.ClientSession() as session:
-        async with session.post(GROQ_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+        async with session.post(GROQ_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=45)) as resp:
             if resp.status != 200:
-                logger.error(f"Groq Error {resp.status}: {await resp.text()}")
+                logger.error(f"Groq Error: {resp.status}")
                 return None
             data = await resp.json()
             return data['choices'][0]['message']['content'].strip()
 
-async def call_groq_whisper(audio_path: str) -> Optional[str]:
+async def transcribe_voice(file_path: str) -> Optional[str]:
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-    form_data = aiohttp.FormData()
-    form_data.add_field('file', open(audio_path, 'rb'), filename='audio.ogg')
-    form_data.add_field('model', WHISPER_MODEL)
-
+    form = aiohttp.FormData()
+    form.add_field('file', open(file_path, 'rb'), filename='audio.ogg')
+    form.add_field('model', WHISPER_MODEL)
+    
     async with aiohttp.ClientSession() as session:
-        async with session.post(WHISPER_URL, data=form_data, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-            if resp.status != 200:
-                logger.error(f"Whisper Error {resp.status}: {await resp.text()}")
-                return None
+        async with session.post(WHISPER_URL, data=form, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+            if resp.status != 200: return None
             data = await resp.json()
             return data.get('text', '').strip()
 
-# ═══ ЛОГИКА ПАЙПЛАЙНА ═══
+# ═══ ЛОГИКА ОРКЕСТРАЦИИ ═══
 
-async def process_code_task(summary: str, original_text: str, messages: List[Dict], message: types.Message, bot: Bot, status_msg_id: int):
-    await bot.edit_message_text(chat_id=message.chat.id, message_id=status_msg_id, text="⏳ 👨‍💻 Кодер пишет решение...")
+async def process_request(text: str, user_id: int, username: str):
+    db.ensure_user(user_id, username)
+    db.save_history(user_id, "user", text)
     
-    # Добавляем контекст истории
-    context_messages = messages + [{"role": "user", "content": f"Задача: {original_text}\nСуть: {summary}"}]
-    result = await call_groq_text(context_messages, CODER_PROMPT)
+    # 1. Получаем контекст
+    history = db.get_history(user_id, limit=6)
+    knowledge = db.get_knowledge(user_id)
     
-    if result:
-        db.add_history(message.from_user.id, "assistant", result)
-        await bot.edit_message_text(
-            chat_id=message.chat.id, message_id=status_msg_id, 
-            text=f"💻 <b>Код готов:</b>\n\n<code>{result}</code>", parse_mode="HTML"
-        )
-    else:
-        await bot.edit_message_text(chat_id=message.chat.id, message_id=status_msg_id, text="❌ Ошибка генерации кода.")
+    context_messages = history + [{"role": "system", "content": f"Контекст пользователя:\n{knowledge}"}]
 
-async def process_assistant_task(summary: str, original_text: str, messages: List[Dict], message: types.Message, bot: Bot, status_msg_id: int, is_task_request: bool):
-    await bot.edit_message_text(chat_id=message.chat.id, message_id=status_msg_id, text="⏳ 🤖 Ассистент думает...")
+    # 2. Роутинг (Orchestrator)
+    router_msgs = context_messages + [{"role": "user", "content": f"Запрос: {text}"}]
+    # Добавляем системный промпт роутера в начало
+    router_msgs.insert(0, {"role": "system", "content": PROMPT_ORCHESTRATOR})
     
-    # Получаем знания о пользователе
-    knowledge = db.get_knowledge(message.from_user.id)
-    system_full = f"{ASSISTANT_PROMPT}\n\n📚 Знания о пользователе:\n{knowledge}"
-    
-    context_messages = messages + [{"role": "user", "content": f"Запрос: {original_text}\nСуть: {summary}"}]
-    result = await call_groq_text(context_messages, system_full)
-    
-    if result:
-        db.add_history(message.from_user.id, "assistant", result)
-        
-        # Если это задача на запоминание, сохраняем в БД отдельно (упрощенно)
-        final_text = f"🤖 <b>Ответ:</b>\n\n{result}"
-        if is_task_request:
-            db.add_task(message.from_user.id, original_text)
-            final_text += "\n\n<i>✅ Задача сохранена в облачную базу.</i>"
-            
-        await bot.edit_message_text(
-            chat_id=message.chat.id, message_id=status_msg_id, 
-            text=final_text, parse_mode="HTML"
-        )
-    else:
-        await bot.edit_message_text(chat_id=message.chat.id, message_id=status_msg_id, text="❌ Ошибка ответа.")
-
-async def run_pipeline(text_content: str, message: types.Message, bot: Bot, status_msg_id: int):
-    tg_id = message.from_user.id
-    db.ensure_user(tg_id, message.from_user.username)
-    db.add_history(tg_id, "user", text_content)
-    
-    # Получаем историю для контекста
-    history = db.get_recent_history(tg_id, limit=4) # Берем 4 последних сообщения
+    router_response = await call_groq(router_msgs, model=MODEL_FAST, json_mode=True)
+    if not router_response:
+        return "❌ Ошибка маршрутизации."
     
     try:
-        # 1. Роутер
-        router_json = await call_groq_text(history + [{"role": "user", "content": text_content}], ROUTER_PROMPT, response_format="json")
-        if not router_json: raise Exception("Роутер молчит")
-        
-        clean_json = router_json.replace("```json", "").replace("```", "").strip()
-        decision = json.loads(clean_json)
-        
-        task_type = decision.get("type", "ASSISTANT")
-        summary = decision.get("summary", "")
-        is_task = decision.get("is_task", False)
-        
-        logger.info(f"🔀 Роутинг: {task_type} | Task: {is_task}")
+        decision = json.loads(router_response.replace("```json", "").replace("```", ""))
+        agent_name = decision.get("agent", "PERSONAL_ASSISTANT")
+        has_deadline = decision.get("has_deadline", False)
+        deadline_time = decision.get("deadline_time")
+    except:
+        agent_name = "PERSONAL_ASSISTANT"
 
-        if task_type == "CODE":
-            await process_code_task(summary, text_content, history, message, bot, status_msg_id)
-        else:
-            await process_assistant_task(summary, text_content, history, message, bot, status_msg_id, is_task)
-            
-    except Exception as e:
-        logger.error(f"Pipeline error: {e}")
-        await bot.edit_message_text(chat_id=message.chat.id, message_id=status_msg_id, text=f"❌ Сбой: {str(e)}")
+    # 3. Выбор промпта агента
+    system_prompt = AGENTS_PROMPTS.get(agent_name, AGENTS_PROMPTS["PERSONAL_ASSISTANT"])
+    
+    # 4. Выполнение задачи агентом
+    agent_msgs = context_messages + [{"role": "user", "content": text}]
+    agent_msgs.insert(0, {"role": "system", "content": system_prompt})
+    
+    result = await call_groq(agent_msgs, model=MODEL_PRO if agent_name in ["BUSINESS_COACH", "ANALYTICS_AGENT"] else MODEL_FAST)
+    
+    if not result:
+        return "❌ Агент не ответил."
 
-# ═══ HANDLERS ═══
+    # 5. Пост-обработка (Задачи и Обучение)
+    final_response = result
+    
+    # Если есть дедлайн
+    if has_deadline and deadline_time:
+        db.add_task(user_id, f"Напоминание: {text}", deadline_time)
+        final_response += "\n\n⏰ **Напоминание установлено!**"
+    
+    # Сохраняем ответ
+    db.save_history(user_id, "assistant", final_response)
+    
+    return final_response
+
+# ═══ TELEGRAM HANDLERS ═══
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
-        "🚀 <b>Мультиагентный ИИ с облачной памятью!</b>\n\n"
-        "Я умею:\n"
-        "• Писать код (Кодер)\n"
-        "• Планировать и общаться (Ассистент)\n"
-        "• Слушать голос (Whisper)\n"
-        "• Помнить всё в Supabase (Облако)\n\n"
-        "Команды:\n"
-        "/tasks — мои задачи из облака\n"
-        "/history — история переписки\n"
-        "/clear — очистить задачи"
+        "🚀 <b>Мультиагентная система активирована</b>\n\n"
+        "Доступные роли:\n"
+        "🎯 Business Coach (Продажи, стратегия)\n"
+        "📋 Personal Assistant (Задачи, план)\n"
+        "🔍 Search Agent (Факты, тренды)\n"
+        "📊 Analytics Agent (Инсайты)\n"
+        "🧠 Learning Agent (Адаптация)\n"
+        "💻 Coder (Код)\n\n"
+        "Просто напиши задачу. Я сам выберу нужного специалиста."
     )
 
 @dp.message(Command("tasks"))
 async def cmd_tasks(message: types.Message):
     tasks = db.get_tasks(message.from_user.id)
     if not tasks:
-        await message.answer("📭 Задач в облаке нет.")
+        await message.answer("📭 Задач нет.")
         return
-    
-    text = "📋 <b>Ваши задачи (Supabase):</b>\n\n"
-    for i, t in enumerate(tasks, 1):
-        text += f"{i}. {t['content']}\n"
-    await message.answer(text, parse_mode="HTML")
-
-@dp.message(Command("history"))
-async def cmd_history(message: types.Message):
-    history = db.get_recent_history(message.from_user.id, limit=10)
-    if not history:
-        await message.answer("📭 История пуста.")
-        return
-    
-    text = "📜 <b>История:</b>\n\n"
-    for h in history[-5:]: # Показываем последние 5
-        emoji = "👤" if h['role'] == 'user' else "🤖"
-        text += f"{emoji}: {h['message'][:100]}...\n"
-    await message.answer(text)
-
-@dp.message(Command("clear"))
-async def cmd_clear(message: types.Message):
-    db.clear_tasks(message.from_user.id)
-    await message.answer("🗑️ Все задачи отмечены как выполненные в облаке.")
+    txt = "📋 <b>Ваши задачи:</b>\n"
+    for t in tasks:
+        txt += f"• {t['content']}\n"
+    await message.answer(txt, parse_mode="HTML")
 
 @dp.message(F.voice)
 async def handle_voice(message: types.Message):
-    status_msg = await message.answer("⏳ 🎧 Слушаю...")
-    file_id = message.voice.file_id
-    file = await bot.get_file(file_id)
-    file_path = f"voice_{message.message_id}.ogg"
+    status = await message.answer("🎧 Расшифровываю...")
+    file = await bot.get_file(message.voice.file_id)
+    path = f"voice_{message.message_id}.ogg"
+    await bot.download_file(file.file_path, path)
     
     try:
-        await bot.download_file(file.file_path, file_path)
-        text = await call_groq_whisper(file_path)
+        text = await transcribe_voice(path)
         if text:
-            await bot.edit_message_text(
-                chat_id=message.chat.id, message_id=status_msg.message_id,
-                text=f"🎤 <b>Вы сказали:</b> <i>{text}</i>\n\n⏳ Думаю...", parse_mode="HTML"
-            )
-            await run_pipeline(text, message, bot, status_msg.message_id)
+            await status.edit_text(f"🎤 <i>{text}</i>\n\n⏳ Думаю...", parse_mode="HTML")
+            response = await process_request(text, message.from_user.id, message.from_user.username)
+            await status.edit_text(response, parse_mode="HTML")
         else:
-            await bot.edit_message_text(chat_id=message.chat.id, message_id=status_msg.message_id, text="❌ Не расслышал.")
+            await status.edit_text("❌ Не расслышал.")
     finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        if os.path.exists(path): os.remove(path)
 
 @dp.message()
 async def handle_text(message: types.Message):
     if not message.text: return
-    status_msg = await message.answer("⏳ 🧠 Думаю...")
-    await run_pipeline(message.text, message, bot, status_msg.message_id)
+    status = await message.answer("⏳ Оркестратор выбирает агента...")
+    try:
+        response = await process_request(message.text, message.from_user.id, message.from_user.username)
+        await status.edit_text(response, parse_mode="HTML")
+    except Exception as e:
+        logger.error(e)
+        await status.edit_text(f"❌ Ошибка: {str(e)}")
 
 # ═══ ЗАПУСК ═══
 async def main():
     await bot.session.close()
-    logger.info("🚀 Бот запущен с Supabase Cloud!")
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await bot.session.close()
+    logger.info("🚀 Multi-Agent System Started")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
