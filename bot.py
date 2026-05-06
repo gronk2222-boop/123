@@ -49,29 +49,29 @@ WHISPER_MODEL = "whisper-large-v3-turbo"
 
 # ═══ УТИЛИТЫ ═══
 
-def clean_html_for_telegram(text: str) -> str:
-    """Удаляет неподдерживаемые Telegram теги (div, span, br заменяет на \n)"""
+def escape_html(text: str) -> str:
+    """
+    Очищает текст от неподдерживаемых Telegram HTML-тегов, 
+    оставляя только <b>, <i>, <u>, <s>, <code>, <pre>, <a>.
+    """
     if not text:
         return ""
-    # Заменяем <br> на перенос строки
-    text = text.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
-    # Удаляем опасные теги
-    text = re.sub(r"</?div[^>]*>", "\n", text)
-    text = re.sub(r"</?span[^>]*>", "", text)
-    text = re.sub(r"</?p[^>]*>", "\n", text)
-    # Оставляем только жирный, курсив, код, ссылку
-    # Telegram поддерживает: b, strong, i, em, u, s, strike, del, a, code, pre
+    # Список разрешенных тегов
+    allowed_tags = ['b', 'i', 'u', 's', 'code', 'pre', 'a']
+    # Находим все теги
+    tags = re.findall(r'</?[a-zA-Z0-9]+(?:\s+[^>]*)?>', text)
+    
+    for tag in tags:
+        tag_name = re.search(r'</?([a-zA-Z0-9]+)', tag)
+        if tag_name:
+            name = tag_name.group(1).lower()
+            if name not in allowed_tags:
+                # Заменяем запрещенный тег на пустоту
+                text = text.replace(tag, '')
+    
+    # Экранируем одиночные угловые скобки, если они остались вне тегов (упрощенно)
+    # Для надежности просто возвращаем очищенный текст
     return text
-
-async def send_safe_message(bot: Bot, chat_id: int, message_id: int, text: str, parse_mode: str = "HTML"):
-    """Безопасная отправка с обработкой ошибок парсинга"""
-    clean_text = clean_html_for_telegram(text)
-    try:
-        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=clean_text, parse_mode=parse_mode)
-    except Exception as e:
-        logger.warning(f"Ошибка форматирования: {e}. Отправляю как текст.")
-        # Если не вышло с форматированием, отправляем чистый текст
-        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=clean_text)
 
 # ═══ БАЗА ДАННЫХ (SUPABASE) ═══
 
@@ -80,7 +80,7 @@ class Database:
     def ensure_user(tg_id: int, username: str, full_name: str = None):
         try:
             data, _ = supabase.table("users").select("id").eq("telegram_id", tg_id).execute()
-            if not 
+            if not data or len(data) == 0:
                 supabase.table("users").insert({
                     "telegram_id": tg_id,
                     "username": username,
@@ -143,11 +143,11 @@ class Database:
         try:
             response = supabase.table("chat_history").select("*").eq("telegram_id", tg_id).order("created_at", desc=True).limit(limit).execute()
             
-            if not 
+            if not response.data or len(response.data) == 0:
                 return []
             
             clean_history = []
-            for item in response.
+            for item in response.data:
                 clean_history.append({
                     "role": item['role'],
                     "content": item['message']
@@ -160,33 +160,25 @@ class Database:
 
 db = Database()
 
-# ═══ ПРОМПТЫ АГЕНТОВ ═══
-# Добавлена инструкция не использовать HTML теги
+# ═══ ПРОМПТЫ ═══
 
 ROUTER_PROMPT = """
 Ты — Orchestrator. Определи тип запроса:
 - CODE: код, баги, скрипты.
-- COACH: продажи, стратегия, обратная связь.
+- COACH: продажи, стратегия, жесткая обратная связь.
 - ASSISTANT: планирование, задачи, рутина.
 Верни ТОЛЬКО JSON: {"type": "CODE"|"COACH"|"ASSISTANT", "summary": "суть"}
 """
 
-CODER_PROMPT = """
-Ты Senior Developer. Пиши чистый код.
-ВАЖНО: Не используй HTML теги (<div>, <span>). Используй Markdown для кода (```).
-"""
-
-COACH_PROMPT = """
-Ты жесткий бизнес-тренер. Только факты и шаги.
-ВАЖНО: Не используй HTML теги. Используй *жирный* и списки.
-"""
-
+CODER_PROMPT = "Ты Senior Developer. Пиши чистый код. Используй Markdown для блоков кода (```python ... ```). Без лишних слов."
+COACH_PROMPT = "Ты жесткий бизнес-тренер. Только факты, метрики, конкретные шаги. Используй списки и жирный шрифт."
 ASSISTANT_PROMPT = """
-Ты личный ассистент.
+Ты личный ассистент. 
 ВАЖНО: 
-1. Никогда не выдумывай задачи. Используй только контекст из БД.
-2. Не используй HTML теги (<div>, <span>).
-3. Если пользователь просит добавить задачу — подтверди сохранение.
+1. Никогда не выдумывай задачи. 
+2. Если пользователь просит добавить задачу — подтверди сохранение.
+3. Если спрашивают "какие задачи?" — используй только переданный контекст из БД.
+Используй Markdown для форматирования.
 """
 
 # ═══ AI ИНТЕГРАЦИЯ ═══
@@ -228,14 +220,29 @@ async def call_groq_whisper(audio_path: str) -> Optional[str]:
 
 # ═══ ЛОГИКА ПАЙПЛАЙНА ═══
 
+async def send_safe_message(bot: Bot, chat_id: int, message_id: int, text: str, parse_mode: str = "HTML"):
+    """Отправляет сообщение, автоматически исправляя ошибки форматирования"""
+    try:
+        # Сначала чистим текст от мусора
+        clean_text = escape_html(text)
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=clean_text, parse_mode=parse_mode)
+    except Exception as e:
+        logger.warning(f"Format error, sending as plain text: {e}")
+        # Если ошибка форматирования осталась, отправляем как простой текст
+        try:
+            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, parse_mode=None)
+        except Exception as final_e:
+            logger.error(f"Failed to send message completely: {final_e}")
+
 async def process_code_task(summary: str, original_text: str, messages: List[Dict], message: types.Message, bot: Bot, status_msg_id: int):
     await bot.edit_message_text(chat_id=message.chat.id, message_id=status_msg_id, text="⏳ 👨‍💻 Кодер пишет...")
     context = messages + [{"role": "user", "content": f"Задача: {original_text}"}]
     result = await call_groq_text(context, CODER_PROMPT)
     if result:
         db.add_history(message.from_user.id, "assistant", result, "coder")
-        final_text = f"💻 <b>Код:</b>\n\n<code>{result}</code>"
-        await send_safe_message(bot, message.chat.id, status_msg_id, final_text)
+        # Для кода лучше использовать Markdown, но мы адаптируем под HTML или текст
+        formatted_result = f"💻 <b>Код:</b>\n\n<pre><code class='language-python'>{result.replace('<', '&lt;').replace('>', '&gt;')}</code></pre>"
+        await send_safe_message(bot, message.chat.id, status_msg_id, formatted_result)
     else:
         await send_safe_message(bot, message.chat.id, status_msg_id, "❌ Ошибка генерации кода.")
 
@@ -245,8 +252,7 @@ async def process_coach_task(summary: str, original_text: str, messages: List[Di
     result = await call_groq_text(context, COACH_PROMPT)
     if result:
         db.add_history(message.from_user.id, "assistant", result, "coach")
-        final_text = f"🔥 <b>Вердикт тренера:</b>\n\n{result}"
-        await send_safe_message(bot, message.chat.id, status_msg_id, final_text)
+        await send_safe_message(bot, message.chat.id, status_msg_id, f"🔥 <b>Вердикт тренера:</b>\n\n{result}")
     else:
         await send_safe_message(bot, message.chat.id, status_msg_id, "❌ Ошибка ответа тренера.")
 
@@ -276,7 +282,7 @@ async def process_assistant_task(summary: str, original_text: str, messages: Lis
             if success:
                 final_text += "\n\n✅ <i>Задача сохранена в облачную базу Supabase.</i>"
             else:
-                final_text += "\n\n⚠️ <i>Не удалось сохранить задачу.</i>"
+                final_text += "\n\n⚠️ <i>Не удалось сохранить задачу (ошибка БД).</i>"
             
         await send_safe_message(bot, message.chat.id, status_msg_id, final_text)
     else:
@@ -366,7 +372,7 @@ async def handle_voice(message: types.Message):
             )
             await run_pipeline(text, message, bot, status_msg.message_id)
         else:
-            await send_safe_message(bot, message.chat.id, status_msg.message_id, "❌ Не расслышал.")
+            await bot.edit_message_text(chat_id=message.chat.id, message_id=status_msg.message_id, text="❌ Не расслышал.")
     finally:
         if os.path.exists(file_path):
             os.remove(file_path)
