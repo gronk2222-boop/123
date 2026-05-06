@@ -110,10 +110,14 @@ class Database:
     @staticmethod
     def get_knowledge(tg_id: int) -> str:
         """Получает знания о пользователе"""
-        response = supabase.table("ai_knowledge").select("key_name, value").eq("telegram_id", tg_id).execute()
-        if not response.data:
-            return "Нет специальных инструкций."
-        return "\n".join([f"- {item['key_name']}: {item['value']}" for item in response.data])
+        try:
+            response = supabase.table("ai_knowledge").select("key_name, value").eq("telegram_id", tg_id).execute()
+            if not response.data:
+                return "Нет специальных инструкций."
+            return "\n".join([f"- {item['key_name']}: {item['value']}" for item in response.data])
+        except Exception as e:
+            logger.error(f"Error getting knowledge: {e}")
+            return "Ошибка загрузки знаний."
 
 db = Database()
 
