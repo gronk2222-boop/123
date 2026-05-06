@@ -62,7 +62,6 @@ class AgentType(str, Enum):
 # ═══ ПРОМПТЫ ═══
 ROUTER_PROMPT = """Ты — Orchestrator мультиагентного ИИ.
 Определи тип запроса строго из списка: CODE, COACH, ASSISTANT, WRITER, ANALYST, TRANSLATOR.
-...
 Верни ТОЛЬКО JSON: {"type": "<тип>", "summary": "краткая суть запроса"}"""
 
 AGENT_PROMPTS = {
@@ -96,8 +95,77 @@ def extract_json(text: str) -> dict:
 
 # ═══ БАЗА ДАННЫХ ═══
 class Database:
-    # ... все методы остались те же, что в предыдущем ответе ...
-    pass
+    @staticmethod
+    def ensure_user(tg_id: int, username: str, full_name: str = None):
+        try:
+            data, _ = supabase.table("users").select("id").eq("telegram_id", tg_id).execute()
+            if not data or len(data) == 0:
+                supabase.table("users").insert({
+                    "telegram_id": tg_id,
+                    "username": username,
+                    "full_name": full_name
+                }).execute()
+            else:
+                supabase.table("users").update({"last_active": datetime.now().isoformat()}).eq("telegram_id", tg_id).execute()
+        except Exception as e:
+            logger.error(f"DB User Error: {e}")
+
+    @staticmethod
+    def add_task(tg_id: int, content: str, due_date: str = None):
+        try:
+            task_data = {
+                "telegram_id": tg_id,
+                "content": content,
+                "status": "pending",
+                "created_at": datetime.now().isoformat()
+            }
+            if due_date:
+                task_data["due_date"] = due_date
+            supabase.table("tasks").insert(task_data).execute()
+            return True
+        except Exception as e:
+            logger.error(f"DB Task Error: {e}")
+            return False
+
+    @staticmethod
+    def get_tasks(tg_id: int) -> List[Dict]:
+        try:
+            response = supabase.table("tasks").select("*").eq("telegram_id", tg_id).eq("status", "pending").order("created_at", desc=True).execute()
+            return response.data or []
+        except Exception as e:
+            logger.error(f"DB Get Tasks Error: {e}")
+            return []
+
+    @staticmethod
+    def clear_tasks(tg_id: int):
+        try:
+            supabase.table("tasks").update({"status": "completed", "completed_at": datetime.now().isoformat()}).eq("telegram_id", tg_id).eq("status", "pending").execute()
+        except Exception as e:
+            logger.error(f"DB Clear Error: {e}")
+
+    @staticmethod
+    def add_history(tg_id: int, role: str, message: str, agent: str = "orchestrator"):
+        try:
+            supabase.table("chat_history").insert({
+                "telegram_id": tg_id,
+                "role": role,
+                "agent_type": agent,
+                "message": message
+            }).execute()
+        except Exception as e:
+            logger.error(f"DB History Error: {e}")
+
+    @staticmethod
+    def get_recent_history(tg_id: int, limit: int = 5) -> List[Dict]:
+        try:
+            response = supabase.table("chat_history").select("*").eq("telegram_id", tg_id).order("created_at", desc=True).limit(limit).execute()
+            if not response.data:
+                return []
+            clean_history = [{"role": item['role'], "content": item['message']} for item in sorted(response.data, key=lambda x: x['created_at'])]
+            return clean_history
+        except Exception as e:
+            logger.error(f"DB History Get Error: {e}")
+            return []
 
 db = Database()
 
@@ -137,18 +205,33 @@ class GroqClient:
         return None
 
     async def chat_completion(self, messages, system_prompt, response_format=None):
-        # ... реализация без изменений ...
-        pass
+        full_messages = [{"role": "system", "content": system_prompt}] + messages
+        payload = {
+            "model": TEXT_MODEL,
+            "messages": full_messages,
+            "temperature": 0.2,
+            "max_tokens": MAX_TOKENS
+        }
+        if response_format == "json":
+            payload["response_format"] = {"type": "json_object"}
+        data = await self._post(GROQ_URL, json_data=payload)
+        if data:
+            return data['choices'][0]['message']['content'].strip()
+        return None
 
     async def transcribe_audio(self, audio_path):
-        # ... реализация без изменений ...
-        pass
+        form = aiohttp.FormData()
+        form.add_field('file', open(audio_path, 'rb'), filename='audio.ogg')
+        form.add_field('model', WHISPER_MODEL)
+        data = await self._post(WHISPER_URL, data=form, timeout=60)
+        if data:
+            return data.get('text', '').strip()
+        return None
 
 groq = GroqClient(GROQ_API_KEY)
 
 # ═══ КЛАВИАТУРЫ ═══
 def get_main_keyboard():
-    """Основная Reply‑клавиатура (постоянная под строкой ввода)"""
     buttons = [
         [KeyboardButton(text="📋 Мои задачи"), KeyboardButton(text="🗑 Очистить задачи")],
         [KeyboardButton(text="🤖 Сменить агента"), KeyboardButton(text="❓ Помощь")]
@@ -160,11 +243,10 @@ def get_main_keyboard():
     )
 
 def get_agents_inline_keyboard():
-    """Инлайн‑кнопки для выбора агента"""
     agents = list(AgentType)
     buttons = []
     row = []
-    for i, agent in enumerate(agents):
+    for agent in agents:
         emoji = {
             AgentType.CODE: "🧑‍💻",
             AgentType.COACH: "📈",
@@ -177,7 +259,7 @@ def get_agents_inline_keyboard():
             text=f"{emoji} {agent.value.capitalize()}",
             callback_data=f"set_agent:{agent.value}"
         ))
-        if len(row) == 3:  # по 3 кнопки в ряд
+        if len(row) == 3:
             buttons.append(row)
             row = []
     if row:
@@ -185,13 +267,12 @@ def get_agents_inline_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_tasks_inline_keyboard():
-    """Инлайн‑кнопки для быстрых действий с задачами"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Мои задачи", callback_data="show_tasks"),
          InlineKeyboardButton(text="🗑 Очистить", callback_data="clear_tasks")]
     ])
 
-# ═══ ХРАНЕНИЕ РЕЖИМОВ ═══
+# ═══ СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЕЙ ═══
 user_modes: Dict[int, AgentType] = {}
 
 # ═══ ЛОГИКА ПАЙПЛАЙНА ═══
@@ -253,7 +334,6 @@ async def handle_agent(agent: AgentType, summary: str, original_text: str, messa
     }
     final_text = prefix_map.get(agent, result)
 
-    # Для ассистента добавляем кнопки с задачами
     reply_markup = get_tasks_inline_keyboard() if agent == AgentType.ASSISTANT else None
 
     if agent == AgentType.ASSISTANT and any(kw in summary.lower() for kw in ["добавить задачу", "новая задача", "запланировать", "напомнить"]):
@@ -288,6 +368,10 @@ async def run_pipeline(text: str, message: types.Message, bot: Bot, status_msg_i
     except Exception as e:
         logger.error(f"Pipeline error: {e}")
         await send_or_edit(bot, message.chat.id, status_msg_id, f"❌ Сбой маршрутизации: {str(e)}")
+
+# ═══ ИНИЦИАЛИЗАЦИЯ BOT И DISPATCHER (ДОЛЖНЫ БЫТЬ ДО ДЕКОРАТОРОВ!) ═══
+bot = Bot(token=TELEGRAM_TOKEN)
+dp = Dispatcher()
 
 # ═══ ОБРАБОТЧИКИ КОМАНД ═══
 @dp.message(Command("start"))
@@ -339,7 +423,7 @@ async def cmd_resetmode(message: types.Message):
     user_modes.pop(message.from_user.id, None)
     await message.answer("🔁 Режим сброшен. ИИ снова выбирает агента автоматически.", reply_markup=get_main_keyboard())
 
-# ═══ ОБРАБОТЧИКИ ОБЫЧНЫХ СООБЩЕНИЙ ═══
+# ═══ ОБРАБОТЧИКИ КНОПОК REPLY КЛАВИАТУРЫ ═══
 @dp.message(F.text.in_(["📋 Мои задачи"]))
 async def show_tasks_from_button(message: types.Message):
     await cmd_tasks(message)
@@ -363,6 +447,7 @@ async def help_from_button(message: types.Message):
         parse_mode="HTML"
     )
 
+# ═══ ГОЛОСОВЫЕ СООБЩЕНИЯ ═══
 @dp.message(F.voice)
 async def handle_voice(message: types.Message):
     status_msg = await message.answer("⏳ 🎧 Слушаю...")
@@ -385,6 +470,7 @@ async def handle_voice(message: types.Message):
         if os.path.exists(file_path):
             os.remove(file_path)
 
+# ═══ ТЕКСТОВЫЕ СООБЩЕНИЯ ═══
 @dp.message()
 async def handle_text(message: types.Message):
     if not message.text:
@@ -393,14 +479,13 @@ async def handle_text(message: types.Message):
     mode = user_modes.get(message.from_user.id)
     await run_pipeline(message.text, message, bot, status_msg.message_id, force_agent=mode)
 
-# ═══ CALLBACK-ОБРАБОТЧИКИ (инлайн кнопки) ═══
+# ═══ CALLBACK-ОБРАБОТЧИКИ ═══
 @dp.callback_query(F.data.startswith("set_agent:"))
 async def on_set_agent_callback(callback: types.CallbackQuery):
     agent_value = callback.data.split(":")[1]
     agent = AgentType(agent_value)
     user_modes[callback.from_user.id] = agent
     await callback.answer(f"✅ Агент {agent.value} активирован!", show_alert=False)
-    # Обновляем сообщение, чтобы показать выбор
     await callback.message.edit_text(
         f"✅ Выбран агент: <b>{agent.value.capitalize()}</b>\n\n"
         "Теперь введи запрос, и бот будет отвечать через этого агента.",
