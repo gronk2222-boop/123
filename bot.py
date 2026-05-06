@@ -3,7 +3,7 @@ import asyncio
 import aiohttp
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, List, Dict, Any
 
 from aiogram import Bot, Dispatcher, types, F
@@ -12,7 +12,6 @@ from dotenv import load_dotenv
 
 # Исправленный импорт для новых версий supabase
 from supabase import create_client, Client
-from supabase.lib.client_options import ClientOptions
 
 # ═══ НАСТРОЙКА ЛОГИРОВАНИЯ ═══
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -29,7 +28,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 if not all([TELEGRAM_TOKEN, GROQ_API_KEY, SUPABASE_URL, SUPABASE_KEY]):
     raise ValueError("❌ ОШИБКА: Проверьте переменные окружения (TELEGRAM, GROQ, SUPABASE)")
 
-# Очистка ключей
+# Очистка ключей от пробелов
 TELEGRAM_TOKEN = TELEGRAM_TOKEN.strip()
 GROQ_API_KEY = GROQ_API_KEY.strip()
 SUPABASE_URL = SUPABASE_URL.strip()
@@ -37,6 +36,7 @@ SUPABASE_KEY = SUPABASE_KEY.strip()
 
 # Инициализация Supabase
 try:
+    # Важно: передаем чистый URL без /rest/v1 на конце
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
     logger.info("✅ Подключение к Supabase успешно")
 except Exception as e:
@@ -123,10 +123,26 @@ class Database:
 
     @staticmethod
     def get_recent_history(tg_id: int, limit: int = 5) -> List[Dict]:
-        """История для контекста"""
+        """
+        Получает историю и очищает её от лишних полей БД.
+        Возвращает формат, понятный Groq: [{"role": "...", "content": "..."}]
+        """
         try:
             response = supabase.table("chat_history").select("*").eq("telegram_id", tg_id).order("created_at", desc=True).limit(limit).execute()
-            return list(reversed(response.data)) if response.data else []
+            
+            if not response.data:
+                return []
+            
+            # Очищаем данные: оставляем только role и content (message)
+            clean_history = []
+            for item in response.data:
+                clean_history.append({
+                    "role": item['role'],
+                    "content": item['message']
+                })
+            
+            # Переворачиваем список, чтобы старые сообщения были первыми
+            return list(reversed(clean_history))
         except Exception as e:
             logger.error(f"DB History Get Error: {e}")
             return []
@@ -138,41 +154,27 @@ db = Database()
 ROUTER_PROMPT = """
 Ты — Orchestrator. Определи тип запроса:
 - CODE: код, баги, скрипты.
-- COACH: продажи, стратегия, жесткая обратная связь, мотивация через действия.
-- SEARCH: нужны свежие данные, новости, цены (требует поиска).
-- ANALYTICS: анализ метрик, паттернов, отчеты.
+- COACH: продажи, стратегия, жесткая обратная связь.
 - ASSISTANT: планирование, задачи, рутина, черновики.
 
-Верни ТОЛЬКО JSON: {"type": "CODE"|"COACH"|"SEARCH"|"ANALYTICS"|"ASSISTANT", "summary": "суть"}
+Верни ТОЛЬКО JSON: {"type": "CODE"|"COACH"|"ASSISTANT", "summary": "суть"}
 """
 
-# Промпт для КОДЕРА
-CODER_PROMPT = """
-Ты Senior Developer. Пиши чистый код. Без воды. С комментариями. Только решение.
-"""
-
-# Промпт для БИЗНЕС-ТРЕНЕРА
-COACH_PROMPT = """
-Ты жесткий бизнес-тренер. Никакой воды и соплей.
-- Только факты, метрики, конкретные шаги.
-- Если видишь саботаж — указывай прямо.
-- Формат: 🎯 Вывод -> 💡 Инструмент -> ✅ Шаг сейчас.
-"""
-
-# Промпт для АССИСТЕНТА (Задачи)
+CODER_PROMPT = "Ты Senior Developer. Пиши чистый код. Без воды. С комментариями."
+COACH_PROMPT = "Ты жесткий бизнес-тренер. Только факты, метрики, конкретные шаги. Без соплей."
 ASSISTANT_PROMPT = """
 Ты личный ассистент. 
 ВАЖНО: 
-1. Никогда не выдумывай задачи, которых нет. 
-2. Если пользователь просит добавить задачу — подтверди и скажи, что сохранил в базу.
-3. Если спрашивают "какие задачи?" — отвечай только на основе данных из базы (тебе их передадут в контексте).
-4. Стиль: кратко, по делу, списки.
+1. Никогда не выдумывай задачи. 
+2. Если пользователь просит добавить задачу — подтверди сохранение.
+3. Если спрашивают "какие задачи?" — используй только переданный контекст из БД.
 """
 
 # ═══ AI ИНТЕГРАЦИЯ ═══
 
 async def call_groq_text(messages: List[Dict], system_prompt: str, response_format: Optional[str] = None) -> Optional[str]:
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    # messages уже очищены и имеют формат [{"role": "...", "content": "..."}]
     full_messages = [{"role": "system", "content": system_prompt}] + messages
     
     payload = {
@@ -235,10 +237,10 @@ async def process_assistant_task(summary: str, original_text: str, messages: Lis
     real_tasks = db.get_tasks(message.from_user.id)
     tasks_context = ""
     if real_tasks:
-        tasks_list = "\n".join([f"- {t['content']} (статус: {t['status']})" for t in real_tasks])
-        tasks_context = f"\n\n[СИСТЕМНАЯ ПОДСКАЗКА: Вот реальные задачи пользователя из базы:\n{tasks_list}\nИспользуй только их для ответа!]"
+        tasks_list = "\n".join([f"- {t['content']}" for t in real_tasks])
+        tasks_context = f"\n\n[СИСТЕМА: Активные задачи пользователя:\n{tasks_list}]"
     else:
-        tasks_context = "\n\n[СИСТЕМНАЯ ПОДСКАЗКА: У пользователя пока нет активных задач в базе. Не выдумывай их.]"
+        tasks_context = "\n\n[СИСТЕМА: У пользователя нет активных задач. Не выдумывай их.]"
 
     context_text = f"{original_text}{tasks_context}"
     context_messages = messages + [{"role": "user", "content": context_text}]
@@ -248,12 +250,11 @@ async def process_assistant_task(summary: str, original_text: str, messages: Lis
     if result:
         db.add_history(message.from_user.id, "assistant", result, "assistant")
         
-        # Если это было создание задачи, сохраняем явно
         final_text = f"🤖 <b>Ответ:</b>\n\n{result}"
+        
+        # Если это было создание задачи, сохраняем явно в БД
         if is_task_creation:
-            # Парсим дату если есть (упрощенно)
-            due = None 
-            success = db.add_task(message.from_user.id, original_text, due)
+            success = db.add_task(message.from_user.id, original_text)
             if success:
                 final_text += "\n\n✅ <i>Задача сохранена в облачную базу Supabase.</i>"
             else:
@@ -268,12 +269,16 @@ async def run_pipeline(text_content: str, message: types.Message, bot: Bot, stat
     db.ensure_user(tg_id, message.from_user.username, message.from_user.full_name)
     db.add_history(tg_id, "user", text_content, "user")
     
+    # Получаем очищенную историю (только role и content)
     history = db.get_recent_history(tg_id, limit=4)
     
     try:
         # 1. Роутинг
-        router_json = await call_groq_text(history + [{"role": "user", "content": text_content}], ROUTER_PROMPT, response_format="json")
-        if not router_json: raise Exception("Роутер молчит")
+        router_input = history + [{"role": "user", "content": text_content}]
+        router_json = await call_groq_text(router_input, ROUTER_PROMPT, response_format="json")
+        
+        if not router_json: 
+            raise Exception("Роутер молчит")
         
         clean_json = router_json.replace("```json", "").replace("```", "").strip()
         decision = json.loads(clean_json)
@@ -283,15 +288,14 @@ async def run_pipeline(text_content: str, message: types.Message, bot: Bot, stat
         
         logger.info(f"🔀 Маршрут: {task_type}")
 
-        # Определение, является ли запрос созданием задачи
-        is_task_creation = any(word in text_content.lower() for word in ["добавь задачу", "напомни", "поставь задачу", "запланируй", "сохрани задачу"])
+        # Определение создания задачи по ключевым словам
+        is_task_creation = any(word in text_content.lower() for word in ["добавь задачу", "напомни", "поставь задачу", "запланируй", "сохрани задачу", "запиши задачу"])
 
         if task_type == "CODE":
             await process_code_task(summary, text_content, history, message, bot, status_msg_id)
         elif task_type == "COACH":
             await process_coach_task(summary, text_content, history, message, bot, status_msg_id)
         else:
-            # ASSISTANT, SEARCH, ANALYTICS (пока обрабатываем как ассистент с заглушками)
             await process_assistant_task(summary, text_content, history, message, bot, status_msg_id, is_task_creation=is_task_creation)
             
     except Exception as e:
@@ -322,9 +326,7 @@ async def cmd_tasks(message: types.Message):
     
     text = "📋 <b>Ваши задачи (из Supabase):</b>\n\n"
     for i, t in enumerate(tasks, 1):
-        due = t.get('due_date')
-        due_str = f" (до: {due[:16]})" if due else ""
-        text += f"{i}. {t['content']}{due_str}\n"
+        text += f"{i}. {t['content']}\n"
     await message.answer(text, parse_mode="HTML")
 
 @dp.message(Command("clear"))
